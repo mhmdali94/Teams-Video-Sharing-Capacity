@@ -523,7 +523,7 @@ worker_fixups() {  # name ip port — make a cloned server a correct worker (saf
   # App config: worker.env, with LOCAL_NETWORKS set to THIS server's IP
   # (a copied value makes every Madrasati/Microsoft request use the wrong source IP).
   if [[ -f $WORKER_ENV ]]; then
-    grep -qE '@(localhost|127\.0\.0\.1)[:/]' "$WORKER_ENV" \
+    grep -E 'MONGO|REDIS' "$WORKER_ENV" | grep -qE '(@|=|//)(localhost|127\.0\.0\.1)([:/]|$)' \
       && warn "$WORKER_ENV points MongoDB/Redis to localhost: the worker has no local DB. Use main's IP."
     scp "${SSH_OPTS[@]}" -o BatchMode=yes -i "$SSH_KEY" -P "$port" -q "$WORKER_ENV" "root@$ip:$APP_DIR/.env"
     ssh_key "$ip" "$port" "cd '$APP_DIR' && chown desktop:desktop .env && chmod 600 .env &&
@@ -634,7 +634,7 @@ cmd_add_template() { add_server template; }
 cmd_add_existing() { add_server existing; }
 
 cmd_fix_worker() {
-  local name; name=$(pick_server)
+  local name; name=$(pick_server) || return 1
   [[ $(reg_get "$name" $F_ROLE) == worker ]] || die "$name is not a worker."
   worker_fixups "$name" "$(reg_get "$name" $F_IP)" "$(reg_get "$name" $F_PORT)"
 }
@@ -650,6 +650,12 @@ add_server() {  # role: worker (clone onto it) | template (register) | existing 
   name=$(ask "Name (a-z 0-9 -)" ""); valid_name "$name" || die "Bad name."
   reg_exists "$name" && die "Name already used."
   ip=$(ask "IP address" ""); valid_ip "$ip" || die "Bad IP."
+  # Worker setup stops the databases and deletes cookies: never aim it at main.
+  [[ " $(hostname -I) " == *" $ip "* ]] && die "$ip is this main server. Enter the other server's IP."
+  if [[ $role != template && ! -f $WORKER_ENV ]]; then
+    warn "$WORKER_ENV is missing: the worker will have no working app config."
+    confirm "Continue anyway?" || die "Aborted. Create $WORKER_ENV first."
+  fi
   awk -F'\t' -v i="$ip" 'NR>1 && $2==i {f=1} END {exit !f}' "$REGISTRY" && die "IP already registered."
   port=$(ask "SSH port" 22); valid_int "$port" || die "Bad port."
   pw=$(ask_secret "Root password of $ip")
@@ -687,7 +693,7 @@ add_server() {  # role: worker (clone onto it) | template (register) | existing 
   write_default_methods
   grep -q puppeteer "$EXCLUDES" \
     || warn "$EXCLUDES predates the Chrome fix: it skips ~/.cache/puppeteer (Chrome). Delete it and run init."
-  local mfile mid; mfile=$(choose_method); mid=$(basename "$mfile" .sh)
+  local mfile mid; mfile=$(choose_method) || die "No method chosen."; mid=$(basename "$mfile" .sh)
   unset -f method_run; METHOD_NEEDS_TEMPLATE=yes METHOD_COPIES_SYSTEM=no
   # shellcheck source=/dev/null
   source "$mfile"
@@ -695,7 +701,7 @@ add_server() {  # role: worker (clone onto it) | template (register) | existing 
 
   tpl=-
   if [[ $METHOD_NEEDS_TEMPLATE == yes ]]; then
-    tpl=$(choose_template)
+    tpl=$(choose_template) || die "No template chosen."
     local v_tpl v_new
     v_tpl=$(os_version "$tpl"); v_new=$(ssh_key "$ip" "$port" '. /etc/os-release; echo "$ID $VERSION_ID"')
     [[ $v_tpl == "$v_new" ]] || die "OS mismatch: template '$v_tpl' vs new '$v_new'. Reinstall the VPS with $v_tpl."
@@ -726,16 +732,15 @@ add_server() {  # role: worker (clone onto it) | template (register) | existing 
   if [[ $METHOD_COPIES_SYSTEM == yes ]]; then
     # /etc/shadow came from the template: give the new VPS its own root password back.
     info "Restoring the new server's root password..."
-    printf 'root:%s\n' "$pw" | ssh_key "$ip" "$port" chpasswd
-  fi
-  worker_fixups "$name" "$ip" "$port"
-
-  if [[ $METHOD_COPIES_SYSTEM == yes ]]; then
+    printf 'root:%s\n' "$pw" | ssh_key "$ip" "$port" chpasswd \
+      || warn "Could not restore the root password on $ip. It is now the template's password."
+    # Reboot before the fixes: the running system's files were just replaced.
     info "Rebooting $ip..."
     ssh_key "$ip" "$port" 'systemctl reboot' >/dev/null 2>&1 || true
     sleep 15
   fi
   if wait_for_ssh "$ip" "$port" 300 || rekey_with_password "$name"; then
+    worker_fixups "$name" "$ip" "$port"
     reg_set "$name" $F_STATUS online
     ok "$name is online."
   else
@@ -863,7 +868,7 @@ pick_server() {  # -> name
 }
 
 cmd_edit() {
-  local name; name=$(pick_server)
+  local name; name=$(pick_server) || return 1
   echo "  1) Set max teachers (now $(reg_get "$name" $F_MAX))"
   echo "  2) Add paid hours"
   echo "  3) Set status: online / draining / disabled"
@@ -889,7 +894,7 @@ cmd_edit() {
 }
 
 cmd_remove() {
-  local name ip; name=$(pick_server); ip=$(reg_get "$name" $F_IP)
+  local name ip; name=$(pick_server) || return 1; ip=$(reg_get "$name" $F_IP)
   warn "This removes $name ($ip) from the fleet. It does NOT delete the VPS at the provider."
   confirm "Remove $name?" || return 0
   firewall_remove "$ip"
