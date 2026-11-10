@@ -141,10 +141,17 @@ cleanup() {
   [[ -n ${WORK:-} ]] && rm -rf "$WORK"
 }
 
-install_app_services() {
-  local node
+# Starts the app with pm2, the same way as the app's own "pnpm pm2:start", plus
+# a virtual screen for Chrome and a pm2 boot service.
+start_app_with_pm2() {
+  local node node_dir pm2
   node=$(remote "ls -d /home/desktop/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1")
   [[ -n $node ]] || { warn "Node not found for user desktop; the app was not started."; return 0; }
+  node_dir=${node%/node}
+  pm2=$(remote "ls -d $node_dir/pm2 /home/desktop/.local/share/pnpm/pm2 $APP_DIR/node_modules/.bin/pm2 2>/dev/null | head -1")
+  [[ -n $pm2 ]] || { warn "pm2 not found for user desktop; the app was not started."; return 0; }
+
+  info "Starting the virtual screen..."
   remote "command -v Xvfb >/dev/null && command -v xdotool >/dev/null ||
       (apt-get update -qq && apt-get install -y -qq xvfb xdotool)
     cat >/etc/systemd/system/tplus-display.service <<'EOF'
@@ -161,32 +168,30 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-    cat >/etc/systemd/system/tplus-app.service <<'EOF'
-[Unit]
-Description=TPlus Auto Prepare
-After=network-online.target docker.service tplus-display.service
-Requires=tplus-display.service
-
-[Service]
-User=desktop
-WorkingDirectory=$APP_DIR
-Environment=DISPLAY=:99
-Environment=NODE_ENV=production
-Environment=NODE_OPTIONS=--dns-result-order=ipv4first
-ExecStart=$node dist/src/main.js
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    systemctl disable --now tplus-app >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/tplus-app.service
     systemctl daemon-reload
-    systemctl enable --now tplus-display tplus-app >/dev/null 2>&1"
+    systemctl enable --now tplus-display >/dev/null 2>&1"
+
+  info "Starting the app with pm2..."
+  remote "su - desktop -c 'export PATH=$node_dir:\$PATH; cd $APP_DIR
+    $pm2 delete tplus-auto-prepare >/dev/null 2>&1
+    DISPLAY=:99 XAUTHORITY=\$HOME/.Xauthority NODE_ENV=production NODE_OPTIONS=--dns-result-order=ipv4first \
+      $pm2 start dist/src/main.js --name tplus-auto-prepare --update-env
+    $pm2 save --force'"
+
+  info "Setting pm2 to start on boot..."
+  remote "env PATH=$node_dir:\$PATH $pm2 startup systemd -u desktop --hp /home/desktop >/dev/null
+    mkdir -p /etc/systemd/system/pm2-desktop.service.d
+    printf '[Unit]\nAfter=tplus-display.service docker.service\nWants=tplus-display.service\n' \
+      >/etc/systemd/system/pm2-desktop.service.d/display.conf
+    systemctl daemon-reload"
+
   sleep 20
-  if remote 'systemctl is-active tplus-app' >/dev/null; then
-    ok "App is running on $IP and starts on boot."
+  if remote "ss -ltn | grep -q ':3009 '"; then
+    ok "App is running on $IP with pm2 and starts on boot. Check as desktop: pm2 status"
   else
-    warn "App did not stay up. On $IP run: journalctl -u tplus-app -n 50"
+    warn "App is not answering yet. As desktop on $IP run: pm2 logs tplus-auto-prepare --lines 50"
   fi
 }
 
@@ -321,7 +326,7 @@ main() {
   fi
 
   if [[ $start_app == yes ]]; then
-    install_app_services
+    start_app_with_pm2
   else
     info "App not started on $IP."
   fi
