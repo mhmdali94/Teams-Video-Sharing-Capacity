@@ -27,6 +27,12 @@ die()  { printf '%s[x]%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 
 confirm() { local r; read -r -p "$1 [y/N]: " r; [[ $r =~ ^[Yy]$ ]]; }
 
+# A fresh VPS runs automatic updates for its first minutes, which lock apt.
+# Wait for them (up to 10 min) instead of failing.
+APT_WAIT='for i in $(seq 120); do pgrep -x "apt|apt-get|dpkg|unattended-upgr|apt.systemd.dai" >/dev/null || break; if [ $((i % 12)) = 1 ]; then echo "Waiting for automatic updates to finish ($((i / 12)) min): $(pgrep -lx "apt|apt-get|dpkg|unattended-upgr|apt.systemd.dai" | awk "{print \$2}" | sort -u | xargs)"; fi; sleep 5; done'
+# IPv4 + timeouts: a VPS with broken IPv6 otherwise hangs on downloads.
+APT_GET='apt-get -q -o DPkg::Lock::Timeout=600 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=30 -o Acquire::Retries=3'
+
 write_excludes() {  # file
   cat >"$1" <<'EOF'
 # System-specific files: the new server keeps its own
@@ -116,6 +122,35 @@ rm -f /root/.migrate-shadow
 EOS
 }
 
+# Runs on the new server. Some providers hand out a DNS server that does not
+# answer: names never resolve, so apt and the app hang. Switch to public DNS,
+# now and after reboots. Exit: 0 fine, 2 fixed, 3 no internet at all.
+network_fix_script() {
+  cat <<'EOS'
+timeout 5 getent hosts archive.ubuntu.com >/dev/null 2>&1 && exit 0
+timeout 5 bash -c '</dev/tcp/1.1.1.1/80' 2>/dev/null || exit 3
+dev=$(ip route show default | awk '{print $5; exit}')
+old=$(resolvectl dns "$dev" 2>/dev/null | sed 's/^[^:]*://')
+resolvectl dns "$dev" 1.1.1.1 8.8.8.8
+# Persist: replace the dead server(s) in netplan, one list item per line.
+for ip in $old; do
+  case $ip in 1.1.1.1|8.8.8.8) continue ;; esac
+  for f in $(grep -lF "$ip" /etc/netplan/*.yaml 2>/dev/null); do
+    cp "$f" "$f.dns-backup"
+    e=$(printf '%s' "$ip" | sed 's/[.]/\\./g')
+    sed -i -E "s/^([[:space:]]*)- $e[[:space:]]*\$/\\1- 1.1.1.1\\n\\1- 8.8.8.8/; s/([[ ,])$e([] ,])/\\11.1.1.1, 8.8.8.8\\2/" "$f"
+    if netplan generate 2>/dev/null; then rm -f "$f.dns-backup"; else mv "$f.dns-backup" "$f"; fi
+  done
+done
+mkdir -p /etc/systemd/resolved.conf.d
+printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\n' >/etc/systemd/resolved.conf.d/99-public-dns.conf
+# Stop cloud-init from writing the old DNS back at boot.
+[ -d /etc/cloud/cloud.cfg.d ] && echo 'network: {config: disabled}' >/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+timeout 5 getent hosts archive.ubuntu.com >/dev/null 2>&1 || exit 3
+exit 2
+EOS
+}
+
 remote() { sshpass -e ssh "${SSH_OPTS[@]}" -p "$PORT" "root@$IP" "$@"; }
 
 run_rsync() {  # extra-options... -- sources...
@@ -159,7 +194,7 @@ start_app_with_pm2() {
 
   info "Starting the virtual screen..."
   remote "command -v Xvfb >/dev/null && command -v xdotool >/dev/null ||
-      (apt-get update -qq && apt-get install -y -qq xvfb xdotool)
+      { $APT_WAIT; $APT_GET update >/dev/null && $APT_GET install -y xvfb xdotool; }
     cat >/etc/systemd/system/tplus-display.service <<'EOF'
 [Unit]
 Description=Virtual screen :99 for Teams browsers
@@ -208,8 +243,9 @@ main() {
   for t in rsync ssh sshpass awk; do command -v "$t" >/dev/null || missing+=("$t"); done
   if ((${#missing[@]})); then
     info "Installing: ${missing[*]}"
-    apt-get update -qq
-    apt-get install -y -qq rsync openssh-client sshpass gawk >/dev/null
+    bash -c "$APT_WAIT"
+    $APT_GET update >/dev/null
+    $APT_GET install -y rsync openssh-client sshpass gawk >/dev/null
   fi
 
   echo
@@ -295,7 +331,17 @@ main() {
   local again; read -r -p "Type the new server's IP again to start: " again
   [[ $again == "$IP" ]] || die "IP did not match. Nothing was changed."
 
-  remote 'command -v rsync >/dev/null || (apt-get update -qq && apt-get install -y -qq rsync)'
+  info "Checking the new server's internet and DNS..."
+  local net=0
+  network_fix_script | remote 'bash -s' || net=$?
+  case $net in
+    0) ok "Internet and DNS work on $IP." ;;
+    2) ok "DNS on $IP did not answer: switched it to 1.1.1.1 / 8.8.8.8 (kept after reboots)." ;;
+    *) die "$IP has no working internet (even public DNS fails). Ask the provider to enable outgoing traffic." ;;
+  esac
+
+  info "Preparing the new server (installing rsync if needed)..."
+  remote "command -v rsync >/dev/null || { $APT_WAIT; $APT_GET update >/dev/null && $APT_GET install -y rsync; }"
 
   local started=$SECONDS
   info "Copying files. Log: $LOG"
