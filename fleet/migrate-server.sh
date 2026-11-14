@@ -11,6 +11,8 @@
 #   - Provider-specific files (network, DNS, SSH, kernel) are not copied.
 #   - LOCAL_NETWORKS is set to the new IP; Madrasati is pinned if DNS can't find it.
 #   - The app does not start on the new server unless you say so.
+#   - If the provider blocks traffic between its own servers, it can copy
+#     through a relay (another of your servers), like a small VPN.
 # Safe to run again if the connection drops: rsync continues where it stopped.
 # =============================================================================
 set -Eeuo pipefail
@@ -45,8 +47,12 @@ write_excludes() {  # file
 /etc/ssh/*
 /etc/default/*
 /etc/udev/*
-/etc/iptables/rules.v4
+/etc/iptables/*
 /etc/iptables.rules
+# Same-provider fix: these can carry the source's IP and bring it up on the new server
+/etc/cloud/*
+/var/lib/dhcp/*
+/var/lib/NetworkManager/*
 /boot/*
 /usr/lib/modules/*
 /usr/lib/firmware/*
@@ -113,13 +119,15 @@ rm -f /root/.migrate-shadow
 EOS
 }
 
-remote() { sshpass -e ssh "${SSH_OPTS[@]}" -p "$PORT" "root@$IP" "$@"; }
+# CONN_HOST/CONN_PORT is how we reach the new server: its own IP, or a local
+# tunnel through a relay server. IP always stays the new server's real IP.
+remote() { sshpass -e ssh "${SSH_OPTS[@]}" -p "$CONN_PORT" "root@$CONN_HOST" "$@"; }
 
 run_rsync() {  # extra-options... -- sources...
   local opts=() rc=0
   while [[ $1 != -- ]]; do opts+=("$1"); shift; done; shift
   rsync -aHAXR --numeric-ids --partial --info=progress2 --stats "${opts[@]}" \
-    -e "$RSH" "$@" "root@$IP:/" 2> >(tee -a "$LOG" >&2) | tee -a "$LOG" || rc=$?
+    -e "$RSH" "$@" "root@$CONN_HOST:/" 2> >(tee -a "$LOG" >&2) | tee -a "$LOG" || rc=$?
   case $rc in
     0)     ;;
     23|24) warn "rsync code $rc: a few files were skipped or changed during the copy. See $LOG" ;;
@@ -136,8 +144,53 @@ restart_containers() {
   fi
 }
 
+can_reach() { timeout 10 bash -c "</dev/tcp/$CONN_HOST/$CONN_PORT" 2>/dev/null; }
+
+# When the provider blocks traffic between its own servers: tunnel through
+# another server that can reach the new one (like a small VPN).
+open_relay() {
+  local relay_pass lport choice
+  echo "  1) Through your own computer (it must reach both servers; no extra server needed)"
+  echo "  2) Through another server you own"
+  read -r -p "Relay [1]: " choice
+  if [[ ${choice:-1} == 1 ]]; then
+    lport=22022
+    echo
+    echo "On YOUR COMPUTER, open a new terminal and run this, then leave it open:"
+    echo
+    echo "  caffeinate -i ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -R $lport:$IP:$PORT root@$(hostname -I | awk '{print $1}')"
+    echo
+    echo "(caffeinate keeps a Mac awake. On Windows/Linux, run the same line without 'caffeinate -i'.)"
+    echo "It asks for THIS server's root password, then shows nothing: that is normal."
+    read -r -p "Press Enter when it is running... " _
+    CONN_HOST=127.0.0.1 CONN_PORT=$lport
+    RELAY_IP="your computer"
+    return 0
+  fi
+  read -r -p "Relay server IP: " RELAY_IP
+  [[ $RELAY_IP =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "That is not an IP address."
+  [[ $RELAY_IP != "$IP" && " $(hostname -I) " != *" $RELAY_IP "* ]] || die "The relay must be a third server."
+  read -r -p "Relay SSH port [22]: " RELAY_PORT; RELAY_PORT=${RELAY_PORT:-22}
+  [[ $RELAY_PORT =~ ^[0-9]+$ ]] || die "Bad port."
+  read -r -s -p "Root password of $RELAY_IP: " relay_pass; echo
+
+  lport=$((20000 + RANDOM % 10000))
+  RELAY_SOCK="$WORK/relay.sock"
+  SSHPASS=$relay_pass sshpass -e ssh -fN -L "127.0.0.1:$lport:$IP:$PORT" \
+    -o ControlMaster=yes -o ControlPath="$RELAY_SOCK" -o ExitOnForwardFailure=yes \
+    -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$WORK/relay_known_hosts" \
+    -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=30 \
+    -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive \
+    -p "$RELAY_PORT" "root@$RELAY_IP" || { RELAY_SOCK=""; die "Cannot log in to the relay root@$RELAY_IP."; }
+  CONN_HOST=127.0.0.1 CONN_PORT=$lport
+}
+
 cleanup() {
   restart_containers
+  if [[ -n ${GW_ROUTE:-} ]]; then ip route del "$GW_ROUTE/32" 2>/dev/null || true; fi
+  if [[ -n ${RELAY_SOCK:-} && -S $RELAY_SOCK ]]; then
+    ssh -S "$RELAY_SOCK" -O exit "root@$RELAY_IP" >/dev/null 2>&1 || true
+  fi
   [[ -n ${WORK:-} ]] && rm -rf "$WORK"
 }
 
@@ -218,18 +271,41 @@ main() {
   read -r -s -p "Root password of $IP: " SSHPASS; echo
   [[ -n $SSHPASS ]] || die "Empty password."
   export SSHPASS
+  CONN_HOST=$IP CONN_PORT=$PORT
 
   WORK=$(mktemp -d /tmp/migrate.XXXXXX)
   trap cleanup EXIT
   local excludes="$WORK/excludes.txt"
   write_excludes "$excludes"
   LOG="/root/migrate-$IP-$(date +%Y%m%d-%H%M%S).log"
-  local ssh_common="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$WORK/known_hosts -o ConnectTimeout=10 -o ServerAliveInterval=30 -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive"
+  # HostKeyAlias keeps the new server's key under its real IP, also through a relay.
+  local ssh_common="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$WORK/known_hosts -o HostKeyAlias=$IP -o ConnectTimeout=10 -o ServerAliveInterval=30 -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive"
   # shellcheck disable=SC2206
   SSH_OPTS=($ssh_common)
-  RSH="sshpass -e ssh -p $PORT $ssh_common"
 
   info "Checking the new server..."
+  if ! can_reach; then
+    # Same provider: the IP is in our own network block, so it is tried directly
+    # on the local network, which the provider may block. Go through the gateway.
+    local gw
+    gw=$(ip route show default | awk '{print $3; exit}')
+    if ! ip route get "$IP" | grep -q ' via ' && [[ -n $gw && $gw != "$IP" ]]; then
+      info "$IP is on this server's local network. Trying through the gateway $gw..."
+      ip route add "$IP/32" via "$gw" && GW_ROUTE=$IP
+    fi
+    if can_reach; then
+      ok "Reached $IP through the gateway (temporary route, removed at the end)."
+    else
+      if [[ -n ${GW_ROUTE:-} ]]; then ip route del "$GW_ROUTE/32" 2>/dev/null || true; GW_ROUTE=""; fi
+      warn "Cannot reach $IP directly. The provider may block traffic between its own servers."
+      confirm "Copy through another server (relay) that can reach $IP?" \
+        || die "Cannot reach $IP on port $PORT (network problem, not the password)."
+      open_relay
+      can_reach || die "Cannot reach $IP through $RELAY_IP either."
+      ok "Connected to $IP through $RELAY_IP."
+    fi
+  fi
+  RSH="sshpass -e ssh -p $CONN_PORT $ssh_common"
   remote true || die "Cannot log in to root@$IP with that password."
   ok "Password login works."
 
