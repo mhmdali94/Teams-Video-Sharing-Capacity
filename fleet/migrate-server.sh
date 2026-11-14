@@ -31,6 +31,9 @@ confirm() { local r; read -r -p "$1 [y/N]: " r; [[ $r =~ ^[Yy]$ ]]; }
 # Wait for them (up to 10 min) instead of failing.
 APT_WAIT='for i in $(seq 120); do pgrep -x "apt|apt-get|dpkg|unattended-upgr|apt.systemd.dai" >/dev/null || break; if [ $((i % 12)) = 1 ]; then echo "Waiting for automatic updates to finish ($((i / 12)) min): $(pgrep -lx "apt|apt-get|dpkg|unattended-upgr|apt.systemd.dai" | awk "{print \$2}" | sort -u | xargs)"; fi; sleep 5; done'
 # IPv4 + timeouts: a VPS with broken IPv6 otherwise hangs on downloads.
+# On the NEW server only: an automatic package-list update started before the DNS
+# fix hangs for a long time. Stop it (only list downloads, never a running dpkg).
+APT_UNSTICK='systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null; pgrep -x dpkg >/dev/null || pkill -f "apt-get.* update" 2>/dev/null'
 APT_GET='apt-get -q -o DPkg::Lock::Timeout=600 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=30 -o Acquire::Retries=3'
 
 write_excludes() {  # file
@@ -194,7 +197,7 @@ start_app_with_pm2() {
 
   info "Starting the virtual screen..."
   remote "command -v Xvfb >/dev/null && command -v xdotool >/dev/null ||
-      { $APT_WAIT; $APT_GET update >/dev/null && $APT_GET install -y xvfb xdotool; }
+      { $APT_UNSTICK; $APT_WAIT; $APT_GET update >/dev/null && $APT_GET install -y xvfb xdotool; }
     cat >/etc/systemd/system/tplus-display.service <<'EOF'
 [Unit]
 Description=Virtual screen :99 for Teams browsers
@@ -341,7 +344,7 @@ main() {
   esac
 
   info "Preparing the new server (installing rsync if needed)..."
-  remote "command -v rsync >/dev/null || { $APT_WAIT; $APT_GET update >/dev/null && $APT_GET install -y rsync; }"
+  remote "command -v rsync >/dev/null || { $APT_UNSTICK; $APT_WAIT; $APT_GET update >/dev/null && $APT_GET install -y rsync; }"
 
   local started=$SECONDS
   info "Copying files. Log: $LOG"
