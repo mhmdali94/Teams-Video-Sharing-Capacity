@@ -8,7 +8,8 @@
 # Based on the RackNerd rsync method, with the problems we hit fixed:
 #   - MongoDB/Redis are stopped briefly for a final sync, so the copy is safe.
 #   - The new server keeps its own root password, the whole time.
-#   - Provider-specific files (network, DNS, SSH, kernel) are not copied.
+#   - Provider-specific files (network, DNS, SSH, kernel) are not copied, and
+#     the rest becomes an exact mirror (leftovers from the provider's image go).
 #   - LOCAL_NETWORKS is set to the new IP; Madrasati is pinned if DNS can't find it.
 #   - The app does not start on the new server unless you say so.
 # Safe to run again if the connection drops: rsync continues where it stopped.
@@ -98,6 +99,8 @@ write_excludes() {  # file
 # Snaps (e.g. chromium): copy the snap files and their state, but not the
 # mounted contents under /snap/<name>/<revision>, which are mounted again at boot
 /snap/*/*/*
+# Chromium lock files name the master; copied, they stop Chromium from opening
+/home/*/snap/chromium/common/chromium/Singleton*
 # Keep Puppeteer's Chrome (~/.cache/puppeteer), skip the rest of the cache
 + /home/*/.cache/
 + /home/*/.cache/puppeteer/***
@@ -151,6 +154,25 @@ printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\n' >/etc/systemd/resolved.conf.d/99-publi
 [ -d /etc/cloud/cloud.cfg.d ] && echo 'network: {config: disabled}' >/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
 timeout 5 getent hosts archive.ubuntu.com >/dev/null 2>&1 || exit 3
 exit 2
+EOS
+}
+
+# Runs on the new server. Remote-desktop fixes found on real migrations:
+#   - xrdp starts XFCE directly (startxfce4), so XAUTHORITY is never set and
+#     snap apps such as Chromium are refused by the screen.
+#   - Chromium's snap links ~/.config/ibus/bus, which must exist as a folder.
+desktop_fix_script() {
+  cat <<'EOS'
+if [ -f /etc/xrdp/startwm.sh ] && ! grep -q XAUTHORITY /etc/xrdp/startwm.sh; then
+  sed -i '1a export XAUTHORITY="$HOME/.Xauthority"' /etc/xrdp/startwm.sh
+fi
+for h in /home/*; do
+  u=$(basename "$h")
+  id "$u" >/dev/null 2>&1 && [ -d "$h/snap/chromium" ] && [ -d "$h/.config" ] || continue
+  mkdir -p "$h/.config/ibus/bus"
+  chown -R "$u": "$h/.config/ibus"
+done
+exit 0
 EOS
 }
 
@@ -349,7 +371,10 @@ main() {
 
   local started=$SECONDS
   info "Copying files. Log: $LOG"
-  run_rsync --exclude-from="$excludes" -- /
+  # --delete makes the new server an exact mirror: files left over from the
+  # provider's image (e.g. services whose user no longer exists) are removed.
+  # Excluded paths (network, SSH, kernel, boot, root password) are never deleted.
+  run_rsync --delete --exclude-from="$excludes" -- /
   ok "Files copied in $(( (SECONDS - started) / 60 )) min."
 
   if [[ -n $RUNNING_CONTAINERS && $safe_db == yes ]]; then
@@ -374,6 +399,7 @@ main() {
       f=$(sed -n "s/^What=//p" "$u")
       if [ -n "$f" ] && [ ! -e "$f" ]; then rm -f "$u" /etc/systemd/system/*/"$(basename "$u")"; fi
     done'
+  desktop_fix_script | remote 'bash -s'
   # Nothing may auto-start until the settings below are right.
   remote 'rm -f /etc/systemd/system/multi-user.target.wants/tplus-app.service \
                 /etc/systemd/system/multi-user.target.wants/pm2-desktop.service'
