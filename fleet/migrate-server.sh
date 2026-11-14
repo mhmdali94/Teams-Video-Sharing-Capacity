@@ -33,7 +33,7 @@ APT_WAIT='for i in $(seq 120); do pgrep -x "apt|apt-get|dpkg|unattended-upgr|apt
 # IPv4 + timeouts: a VPS with broken IPv6 otherwise hangs on downloads.
 # On the NEW server only: an automatic package-list update started before the DNS
 # fix hangs for a long time. Stop it (only list downloads, never a running dpkg).
-APT_UNSTICK='systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null; pgrep -x dpkg >/dev/null || pkill -f "apt-get.* update" 2>/dev/null'
+APT_UNSTICK='systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null; pgrep -x dpkg >/dev/null || pkill -x apt-get 2>/dev/null; true'
 APT_GET='apt-get -q -o DPkg::Lock::Timeout=600 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=30 -o Acquire::Retries=3'
 
 write_excludes() {  # file
@@ -344,7 +344,8 @@ main() {
   esac
 
   info "Preparing the new server (installing rsync if needed)..."
-  remote "command -v rsync >/dev/null || { $APT_UNSTICK; $APT_WAIT; $APT_GET update >/dev/null && $APT_GET install -y rsync; }"
+  remote "command -v rsync >/dev/null || { $APT_UNSTICK; $APT_WAIT; $APT_GET update >/dev/null && $APT_GET install -y rsync; }" \
+    || die "Could not install rsync on $IP. Check its internet, then run this script again."
 
   local started=$SECONDS
   info "Copying files. Log: $LOG"
